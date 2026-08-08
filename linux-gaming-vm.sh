@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Linux-Gaming-VM
-# Version 1.4 Test 2 (manual reboot marker)
+# Version 0.2
 #
 # Designed for Vast.ai KVM virtual machines running Ubuntu with KDE Plasma.
 # ==============================================================================
