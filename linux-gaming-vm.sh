@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Linux-Gaming-VM
-# Version 0.1
+# Version 1.4 Test 2 (manual reboot marker)
 #
 # Designed for Vast.ai KVM virtual machines running Ubuntu with KDE Plasma.
 # ==============================================================================
@@ -10,7 +10,8 @@ set -u
 set -o pipefail
 
 SCRIPT_NAME="Linux-Gaming-VM"
-SCRIPT_VERSION="0.1"
+SCRIPT_VERSION="1.4-test2"
+SCRIPT_BUILD="2026-08-08-r2"
 
 LOG_DIR="/var/lib/.linux-gaming-vm"
 LOG_FILE="${LOG_DIR}/linux-gaming-vm.log"
@@ -28,6 +29,8 @@ XAUTHORITY_VALUE=""
 
 TAILSCALE_IP="Not connected"
 SUNSHINE_URL="Unavailable"
+NVIDIA_REBOOT_MARKER="${LOG_DIR}/nvidia-reboot.pending"
+APT_INDEX_REFRESHED=0
 RESOLUTION="Keep current"
 REFRESH_RATE="Keep current"
 
@@ -177,7 +180,8 @@ banner() {
     cat <<'EOF'
 =========================================
 Linux-Gaming-VM
-Version 0.1
+Version 1.4 Test 2
+Build 2026-08-08-r2
 =========================================
 
 This script is designed for Vast.ai KVM virtual machines.
@@ -193,6 +197,69 @@ Press ENTER to continue...
 EOF
 
     [[ -t 0 ]] && read -r || true
+}
+
+self_check_script() {
+    local script_path
+    local duplicate_functions
+    local required_function
+    local failures=0
+
+    script_path="${BASH_SOURCE[0]}"
+
+    if ! bash -n "$script_path" >/dev/null 2>&1; then
+        echo "[SELF-CHECK ERROR] Bash syntax validation failed."
+        ((failures++)) || true
+    fi
+
+    # Guard against the exact set -u bug that previously stopped Sunshine:
+    # a variable must not be referenced by another assignment in the same
+    # local declaration before Bash has made it available.
+    if awk '
+        /^[[:space:]]*local[[:space:]]+dir=.*file=.*[$]dir/ { found=1 }
+        END { exit(found ? 0 : 1) }
+    ' "$script_path"; then
+        echo "[SELF-CHECK ERROR] Unsafe Sunshine local-variable declaration detected."
+        ((failures++)) || true
+    fi
+
+    # Duplicate function definitions are usually an accidental merge/edit.
+    duplicate_functions="$({
+        sed -nE 's/^([A-Za-z_][A-Za-z0-9_]*)\(\)[[:space:]]*\{.*/\1/p' "$script_path" \
+            | sort \
+            | uniq -d
+    } 2>/dev/null || true)"
+
+    if [[ -n "$duplicate_functions" ]]; then
+        echo "[SELF-CHECK ERROR] Duplicate function definition(s):"
+        printf '%s\n' "$duplicate_functions"
+        ((failures++)) || true
+    fi
+
+    # These functions are critical to the two-stage NVIDIA/Sunshine workflow.
+    for required_function in \
+        detect_environment \
+        remove_selkies_webrtc \
+        update_nvidia_driver_with_reboot \
+        install_and_update_applications \
+        configure_tailscale \
+        configure_sunshine \
+        configure_display \
+        summary; do
+
+        if ! grep -qE "^${required_function}\\(\\)[[:space:]]*\\{" "$script_path"; then
+            echo "[SELF-CHECK ERROR] Missing function: $required_function"
+            ((failures++)) || true
+        fi
+    done
+
+    if (( failures > 0 )); then
+        echo "SELF-CHECK FAILED ($failures problem(s))"
+        return 1
+    fi
+
+    echo "SELF-CHECK OK - ${SCRIPT_NAME} ${SCRIPT_VERSION} (${SCRIPT_BUILD})"
+    return 0
 }
 
 require_root() {
@@ -485,6 +552,308 @@ flatpak_install_or_update() {
 }
 
 # ==============================================================================
+# Selkies/WebRTC removal and NVIDIA driver update with manual reboot marker
+# ==============================================================================
+
+remove_selkies_webrtc() {
+    echo
+    echo "========================================="
+    echo "Remove Selkies WebRTC"
+    echo "========================================="
+
+    info "Stopping and removing Selkies WebRTC components"
+
+    # Stop restart loops before removing files.
+    pkill -TERM -f '/opt/selkies-gstreamer|selkies-gstreamer|selkies-launcher.sh' \
+        >>"$LOG_FILE" 2>&1 || true
+    sleep 1
+    pkill -KILL -f '/opt/selkies-gstreamer|selkies-gstreamer|selkies-launcher.sh' \
+        >>"$LOG_FILE" 2>&1 || true
+
+    # Remove Supervisor entries that explicitly launch Selkies.
+    local supervisor_file
+    if [[ -d /etc/supervisor/conf.d ]]; then
+        while IFS= read -r supervisor_file; do
+            [[ -n "$supervisor_file" ]] || continue
+            if grep -qiE 'selkies-gstreamer|selkies-launcher' "$supervisor_file" 2>/dev/null; then
+                write_log INFO "Removing Selkies Supervisor config: $supervisor_file"
+                rm -f "$supervisor_file"
+            fi
+        done < <(find /etc/supervisor/conf.d -maxdepth 1 -type f -name '*.conf' 2>/dev/null)
+
+        if command -v supervisorctl >/dev/null 2>&1; then
+            supervisorctl reread >>"$LOG_FILE" 2>&1 || true
+            supervisorctl update >>"$LOG_FILE" 2>&1 || true
+        fi
+    fi
+
+    # Disable known system and user services if they exist.
+    local unit
+    for unit in selkies.service selkies-gstreamer.service selkies-launcher.service; do
+        systemctl disable --now "$unit" >>"$LOG_FILE" 2>&1 || true
+        systemctl --machine="${DESKTOP_USER}@.host" --user \
+            disable --now "$unit" >>"$LOG_FILE" 2>&1 || true
+    done
+
+    rm -f \
+        /usr/local/bin/selkies-launcher.sh \
+        /etc/systemd/system/selkies.service \
+        /etc/systemd/system/selkies-gstreamer.service \
+        /etc/systemd/system/selkies-launcher.service
+
+    rm -rf /opt/selkies-gstreamer
+
+    if [[ -d "${DESKTOP_HOME}/.config/autostart" ]]; then
+        find "${DESKTOP_HOME}/.config/autostart" -maxdepth 1 -type f \
+            -iname '*selkies*' -delete 2>/dev/null || true
+    fi
+
+    systemctl daemon-reload >>"$LOG_FILE" 2>&1 || true
+
+    if pgrep -f 'selkies-gstreamer|selkies-launcher.sh' >/dev/null 2>&1; then
+        STATUS["Selkies"]="Still running"
+        warn "A Selkies process is still running"
+    else
+        STATUS["Selkies"]="Removed"
+        ok "Selkies WebRTC removed"
+    fi
+}
+
+nvidia_driver_meta_package() {
+    dpkg-query -W -f='${Package}\n' 2>/dev/null \
+        | grep -E '^nvidia-driver-[0-9]+(-open)?$' \
+        | sort -V \
+        | tail -n1
+}
+
+nvidia_marker_field() {
+    local key="$1"
+
+    [[ -f "$NVIDIA_REBOOT_MARKER" ]] || return 1
+    awk -F= -v wanted="$key" '$1 == wanted {sub(/^[^=]*=/, ""); print; exit}' \
+        "$NVIDIA_REBOOT_MARKER"
+}
+
+show_nvidia_reboot_instructions() {
+    echo
+    echo "========================================="
+    echo "NVIDIA DRIVER UPDATED - REBOOT REQUIRED"
+    echo "========================================="
+    echo
+    echo "The NVIDIA packages were updated successfully."
+    echo "The currently loaded kernel driver cannot be replaced safely without a reboot."
+    echo
+    echo "1. Reboot the VM:"
+    echo "   reboot"
+    echo
+    echo "2. After the VM starts, open the terminal again."
+    echo
+    echo "3. Run this same script again:"
+    echo "   sudo ./linux-gaming-vm.sh"
+    echo
+    echo "The reboot marker will be detected automatically and setup will continue."
+    echo "========================================="
+}
+
+update_nvidia_driver_with_reboot() {
+    echo
+    echo "========================================="
+    echo "Update NVIDIA Driver"
+    echo "========================================="
+
+    # If a marker exists, a driver package update already completed on a prior
+    # run. We verify that the machine actually rebooted by comparing Linux boot
+    # IDs. This is more reliable than comparing Debian package revisions with
+    # nvidia-smi's driver version string.
+    if [[ -f "$NVIDIA_REBOOT_MARKER" ]]; then
+        local marker_boot_id=""
+        local current_boot_id=""
+        local expected_meta=""
+        local expected_package=""
+        local running=""
+        local attempt=0
+
+        marker_boot_id="$(nvidia_marker_field boot_id || true)"
+        expected_meta="$(nvidia_marker_field meta_package || true)"
+        expected_package="$(nvidia_marker_field package_version || true)"
+        current_boot_id="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+
+        if [[ -n "$marker_boot_id" && "$current_boot_id" == "$marker_boot_id" ]]; then
+            STATUS["NVIDIA driver update"]="Waiting for reboot"
+            warn "NVIDIA driver packages were updated, but this VM has not rebooted yet"
+            show_nvidia_reboot_instructions
+            exit 0
+        fi
+
+        # Give the NVIDIA stack a short window to become ready after boot.
+        while (( attempt < 15 )); do
+            running="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 || true)"
+            [[ -n "$running" ]] && break
+            sleep 2
+            ((attempt+=1))
+        done
+
+        if [[ -z "$running" ]]; then
+            STATUS["NVIDIA driver update"]="Driver unavailable after reboot"
+            error "The VM rebooted, but the NVIDIA driver is not available yet. The reboot marker was kept."
+            return 1
+        fi
+
+        if [[ -n "$expected_meta" ]]; then
+            local installed_after=""
+            installed_after="$(installed_version "$expected_meta")"
+            write_log INFO "NVIDIA package after reboot: ${expected_meta} ${installed_after:-unknown}"
+
+            if [[ -n "$expected_package" && -n "$installed_after" ]] \
+               && dpkg --compare-versions "$installed_after" lt "$expected_package"; then
+                STATUS["NVIDIA driver update"]="Package verification failed"
+                error "NVIDIA package version after reboot is older than the version recorded by the marker"
+                return 1
+            fi
+        fi
+
+        rm -f "$NVIDIA_REBOOT_MARKER"
+        STATUS["Driver"]="$running"
+        STATUS["NVIDIA driver update"]="Reboot verified"
+        ok "NVIDIA reboot verified; running driver: $running"
+        return 0
+    fi
+
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        STATUS["NVIDIA driver update"]="Skipped"
+        warn "NVIDIA driver is not available; driver update skipped"
+        return 0
+    fi
+
+    wait_apt || return 1
+    run_long "Refreshing package indexes for NVIDIA" apt-get update || return 1
+    APT_INDEX_REFRESHED=1
+
+    local meta=""
+    local installed=""
+    local candidate=""
+    local running_before=""
+    local boot_id_before=""
+    local updated=""
+
+    meta="$(nvidia_driver_meta_package || true)"
+
+    if [[ -z "$meta" ]]; then
+        STATUS["NVIDIA driver update"]="No metapackage"
+        warn "NVIDIA driver metapackage could not be detected; the installed driver branch will not be changed automatically"
+        return 0
+    fi
+
+    installed="$(installed_version "$meta")"
+    candidate="$(candidate_version "$meta")"
+    running_before="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 || true)"
+    boot_id_before="$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)"
+
+    write_log INFO "NVIDIA metapackage: $meta"
+    write_log INFO "NVIDIA installed package version: ${installed:-unknown}"
+    write_log INFO "NVIDIA candidate package version: ${candidate:-unknown}"
+    write_log INFO "NVIDIA running driver before update: ${running_before:-unknown}"
+
+    if [[ -z "$candidate" || "$candidate" == "(none)" ]]; then
+        STATUS["NVIDIA driver update"]="No candidate"
+        warn "No NVIDIA driver update candidate is available"
+        return 0
+    fi
+
+    if [[ -n "$installed" ]] && ! dpkg --compare-versions "$candidate" gt "$installed"; then
+        STATUS["NVIDIA driver update"]="Already latest"
+        ok "NVIDIA driver package is already latest: $installed"
+        return 0
+    fi
+
+    # Update the installed NVIDIA branch explicitly. We do not switch from an
+    # -open branch to proprietary (or vice versa), and we do not jump branches.
+    if ! run_long "Updating NVIDIA driver ($meta)" \
+        env DEBIAN_FRONTEND=noninteractive apt-get install -y "$meta"; then
+        STATUS["NVIDIA driver update"]="Failed"
+        error "NVIDIA driver update failed"
+        return 1
+    fi
+
+    wait_apt || true
+    env DEBIAN_FRONTEND=noninteractive dpkg --configure -a >>"$LOG_FILE" 2>&1 || true
+
+    updated="$(installed_version "$meta")"
+    STATUS["NVIDIA driver update"]="Updated to ${updated:-$candidate}"
+    ok "NVIDIA driver packages updated to ${updated:-$candidate}"
+
+    # Store the boot ID so a second invocation can distinguish a real reboot
+    # from simply rerunning the script in the same boot.
+    {
+        printf 'boot_id=%s\n' "$boot_id_before"
+        printf 'meta_package=%s\n' "$meta"
+        printf 'package_version=%s\n' "${updated:-$candidate}"
+        printf 'driver_before=%s\n' "$running_before"
+    } >"$NVIDIA_REBOOT_MARKER"
+    chmod 600 "$NVIDIA_REBOOT_MARKER"
+
+    show_nvidia_reboot_instructions
+    write_log INFO "Setup stopped intentionally for the required NVIDIA reboot"
+    exit 0
+}
+
+wait_for_desktop_session() {
+    local waited=0
+    local timeout=120
+
+    while (( waited < timeout )); do
+        if [[ -S "/run/user/${DESKTOP_UID}/bus" ]] \
+           && [[ -S /tmp/.X11-unix/X0 || -n "${WAYLAND_DISPLAY:-}" ]]; then
+            ok "Desktop session is ready"
+            return 0
+        fi
+        sleep 2
+        ((waited+=2))
+    done
+
+    warn "Desktop session was not fully ready after ${timeout}s; continuing anyway"
+    return 0
+}
+
+configure_sunshine_privileges() {
+    echo
+    echo "========================================="
+    echo "Sunshine Performance Privileges"
+    echo "========================================="
+
+    local sunshine_bin
+    sunshine_bin="$(readlink -f "$(command -v sunshine 2>/dev/null)" 2>/dev/null || true)"
+
+    if [[ -z "$sunshine_bin" || ! -f "$sunshine_bin" ]]; then
+        STATUS["Sunshine privileges"]="Missing binary"
+        error "Sunshine binary could not be found"
+        return 1
+    fi
+
+    # Sunshine uses CAP_SYS_NICE for high-priority capture/encoder contexts.
+    # CAP_SYS_ADMIN is retained because the native package configures it for
+    # Linux capture methods such as KMS. +p matches Sunshine's package setup.
+    if ! setcap cap_sys_admin,cap_sys_nice+p "$sunshine_bin" >>"$LOG_FILE" 2>&1; then
+        STATUS["Sunshine privileges"]="Failed"
+        error "Sunshine capabilities could not be applied"
+        return 1
+    fi
+
+    local caps
+    caps="$(getcap "$sunshine_bin" 2>/dev/null || true)"
+    write_log INFO "Sunshine capabilities: ${caps:-none}"
+
+    if grep -q 'cap_sys_nice' <<<"$caps"; then
+        STATUS["Sunshine privileges"]="CAP_SYS_NICE enabled"
+        ok "Sunshine CAP_SYS_NICE enabled for high-priority streaming"
+    else
+        STATUS["Sunshine privileges"]="CAP_SYS_NICE missing"
+        error "Sunshine CAP_SYS_NICE verification failed"
+        return 1
+    fi
+}
+
+# ==============================================================================
 # System verification
 # ==============================================================================
 
@@ -686,6 +1055,108 @@ install_or_update_lutris_github() {
     return 1
 }
 
+install_or_update_mangohud_github() {
+    local repository="flightlessmango/MangoHud"
+    local release_json=""
+    local latest_tag=""
+    local latest_version=""
+    local installed_raw=""
+    local installed_version=""
+    local asset_url=""
+    local temp_archive="/tmp/mangohud-latest.tar.gz"
+    local temp_dir="/tmp/mangohud-github-release"
+    local installer=""
+
+    info "Checking MangoHud version"
+
+    release_json="$(github_latest_release_json "$repository" || true)"
+
+    if [[ -z "$release_json" ]]; then
+        write_log WARN "MangoHud GitHub release check failed; using APT fallback"
+        apt_install_or_update mangohud mangohud MangoHud
+        return
+    fi
+
+    if [[ "$(jq -r '.prerelease // false' <<<"$release_json")" == "true" \
+       || "$(jq -r '.draft // false' <<<"$release_json")" == "true" ]]; then
+        write_log WARN "Latest MangoHud GitHub release is not stable; using APT fallback"
+        apt_install_or_update mangohud mangohud MangoHud
+        return
+    fi
+
+    latest_tag="$(jq -r '.tag_name // empty' <<<"$release_json")"
+    latest_version="$(normalize_version "$latest_tag")"
+    installed_raw="$(mangohud --version 2>/dev/null | head -n1 || true)"
+    installed_version="$(normalize_version "$installed_raw")"
+
+    # Ubuntu's older MangoHud package may not support --version reliably.
+    if [[ -z "$installed_version" ]]; then
+        installed_version="$(normalize_version "$(installed_version mangohud)")"
+    fi
+
+    write_log INFO "MangoHud installed version: ${installed_version:-not installed}"
+    write_log INFO "MangoHud latest GitHub version: ${latest_version:-unknown}"
+
+    if [[ -n "$installed_version" && -n "$latest_version" ]] \
+       && ! dpkg --compare-versions "$latest_version" gt "$installed_version"; then
+        STATUS["MangoHud"]="Already latest"
+        ok "MangoHud is already latest"
+        return
+    fi
+
+    asset_url="$(github_release_asset_url \
+        "$release_json" \
+        '(MangoHud|mangohud).*(x86_64|amd64)?.*\.tar\.(gz|xz)$')"
+
+    if [[ -z "$asset_url" ]]; then
+        write_log WARN "No compatible MangoHud release archive found; using APT fallback"
+        apt_install_or_update mangohud mangohud MangoHud
+        return
+    fi
+
+    if ! run_long "Downloading MangoHud ${latest_tag:-latest}" \
+        curl -fL --retry 3 "$asset_url" -o "$temp_archive"; then
+        STATUS["MangoHud"]="Download failed"
+        return 1
+    fi
+
+    rm -rf "$temp_dir"
+    mkdir -p "$temp_dir"
+
+    if ! tar -xf "$temp_archive" -C "$temp_dir" >>"$LOG_FILE" 2>&1; then
+        STATUS["MangoHud"]="Extraction failed"
+        error "MangoHud release archive could not be extracted"
+        rm -rf "$temp_dir" "$temp_archive"
+        return 1
+    fi
+
+    installer="$(find "$temp_dir" -type f -name mangohud-setup.sh | head -n1)"
+
+    if [[ -z "$installer" ]]; then
+        STATUS["MangoHud"]="Installer not found"
+        error "MangoHud release installer was not found"
+        rm -rf "$temp_dir" "$temp_archive"
+        return 1
+    fi
+
+    chmod +x "$installer"
+
+    if run_long "Installing MangoHud ${latest_tag:-latest}" \
+        bash -c 'cd "$1" && ./mangohud-setup.sh install' \
+        _ "$(dirname "$installer")"; then
+
+        STATUS["MangoHud"]="$(
+            [[ -n "$installed_version" ]] && echo Updated || echo Installed
+        )"
+        rm -rf "$temp_dir" "$temp_archive"
+        return 0
+    fi
+
+    STATUS["MangoHud"]="Install or update failed"
+    rm -rf "$temp_dir" "$temp_archive"
+    return 1
+}
+
 install_or_update_discord() {
     local temp_deb="/tmp/discord-latest.deb"
     local installed=""
@@ -852,37 +1323,39 @@ install_and_update_applications() {
 
     wait_apt || return 1
 
-    if ! run_long "Updating APT package indexes" apt-get update; then
-        error "APT package indexes could not be updated"
-        return 1
-    fi
-
-    # Core tools and gaming utilities.
-    apt_install_or_update curl curl curl || true
-    apt_install_or_update wget wget wget || true
-    apt_install_or_update ca-certificates update-ca-certificates "CA certificates" || true
-    apt_install_or_update gnupg gpg GnuPG || true
-    apt_install_or_update jq jq jq || true
-    apt_install_or_update ffmpeg ffmpeg FFmpeg || true
-    apt_install_or_update mangohud mangohud MangoHud || true
-
-    if command -v mangohud >/dev/null 2>&1; then
-        STATUS["MangoHud"]="OK"
-        ok "MangoHud verified"
+    if (( APT_INDEX_REFRESHED == 0 )); then
+        if ! run_long "Updating APT package indexes" apt-get update; then
+            error "APT package indexes could not be updated"
+            return 1
+        fi
+        APT_INDEX_REFRESHED=1
     else
-        STATUS["MangoHud"]="Verification failed"
-        error "MangoHud installation could not be verified"
+        ok "APT package indexes were already refreshed in this run"
     fi
-    apt_install_or_update gamemode gamemoderun GameMode || true
-    apt_install_or_update nvtop nvtop nvtop || true
-    apt_install_or_update btop btop btop || true
-    apt_install_or_update vulkan-tools vulkaninfo "Vulkan Tools" || true
-    apt_install_or_update libvulkan1 "" "Vulkan Loader" || true
-    apt_install_or_update mesa-utils glxinfo "Mesa Utilities" || true
-    apt_install_or_update x11-xserver-utils xrandr "X11 Utilities" || true
-    apt_install_or_update xcvt cvt "CVT utility" || true
 
-    # Gaming applications and launchers.
+    # Install/update common APT utilities in one transaction. This preserves
+    # updates while avoiding repeated dependency resolution and dpkg startup.
+    local core_packages=(
+        curl wget ca-certificates gnupg jq ffmpeg libcap2-bin
+        gamemode nvtop btop vulkan-tools libvulkan1 mesa-utils
+        x11-xserver-utils xinput xcvt
+    )
+
+    wait_apt || return 1
+    if run_long "Installing/updating core gaming utilities" \
+        env DEBIAN_FRONTEND=noninteractive apt-get install -y "${core_packages[@]}"; then
+        ok "Core gaming utilities are installed and up to date"
+    else
+        warn "One or more core utilities could not be updated"
+    fi
+
+    # run_long waits for apt/dpkg to exit. This extra settle step repairs any
+    # interrupted configuration before application-specific updates continue.
+    wait_apt || return 1
+    env DEBIAN_FRONTEND=noninteractive dpkg --configure -a >>"$LOG_FILE" 2>&1 || true
+
+    # Essential gaming tools and applications keep their version-aware updates.
+    install_or_update_mangohud_github || true
     apt_install_or_update steam-installer steam Steam || true
     install_or_update_lutris_github || true
 
@@ -903,6 +1376,9 @@ install_and_update_applications() {
     flatpak_install_or_update net.davidotek.pupgui2 ProtonUp-Qt || true
     install_or_update_tailscale || true
     install_or_update_sunshine || true
+
+    wait_apt || true
+    env DEBIAN_FRONTEND=noninteractive dpkg --configure -a >>"$LOG_FILE" 2>&1 || true
 }
 
 # ==============================================================================
@@ -1026,6 +1502,10 @@ configure_sunshine() {
 
     chmod 600 "$config_file" || true
 
+    # Remove any capture override left from previous troubleshooting so Sunshine
+    # can choose the best supported capture method automatically.
+    sed -i -E '/^[[:space:]]*capture[[:space:]]*=/d' "$config_file"
+
     set_sunshine_option "$config_file" encoder nvenc
     set_sunshine_option "$config_file" upnp disabled
 
@@ -1047,6 +1527,16 @@ configure_sunshine() {
         error "The Sunshine user service could not be found"
         return 1
     fi
+
+    # Stop both the managed service and any manually started stale Sunshine
+    # process, then restore the capabilities before starting one clean instance.
+    systemctl --machine="${DESKTOP_USER}@.host" --user \
+        stop "$service" >>"$LOG_FILE" 2>&1 || true
+    pkill -TERM -x sunshine >>"$LOG_FILE" 2>&1 || true
+    sleep 1
+    pkill -KILL -x sunshine >>"$LOG_FILE" 2>&1 || true
+
+    configure_sunshine_privileges || true
 
     systemctl --machine="${DESKTOP_USER}@.host" --user daemon-reload \
         >>"$LOG_FILE" 2>&1 || true
@@ -1125,13 +1615,11 @@ configure_host_optimizations() {
         route_state="$(tailscale status --json 2>/dev/null | jq -r '
             [.Peer[]? | select(.Online == true)] as $p
             | if ($p | length) == 0 then "No online peer"
-              elif any($p[]; (.CurAddr // "") != "" and (.Relay // "") == "") then "Direct"
-              else "DERP relay"
+              elif any($p[]; (.CurAddr // "") != "") then "Direct peer available"
+              else "Relay or unknown"
               end
         ' 2>/dev/null || true)"
-        [[ -n "$route_state" ]] && info "Tailscale connection: $route_state"
-    else
-        info "Tailscale is not connected; connection type check skipped"
+        [[ -n "$route_state" ]] && info "Tailscale connection check: $route_state"
     fi
 }
 
@@ -1227,6 +1715,63 @@ LINUX_GAMING_VM_WALLPAPER
     else
         write_log WARN "Wallpaper could not be applied automatically"
     fi
+}
+
+configure_mouse_acceleration() {
+    echo
+    echo "========================================="
+    echo "Mouse Acceleration"
+    echo "========================================="
+    echo
+    echo "[1] Disable"
+    echo "[2] Keep Current Setting"
+    echo
+    echo "Choice:"
+
+    if [[ ! -t 0 ]]; then
+        write_log INFO "Mouse acceleration setting kept because no interactive terminal was detected"
+        return 0
+    fi
+
+    local choice
+    while read -r choice; do
+        case "$choice" in
+            1)
+                if ! command -v xinput >/dev/null 2>&1; then
+                    warn "Mouse acceleration could not be changed because xinput is unavailable"
+                    return 0
+                fi
+
+                local changed=0
+                local device_id
+                while read -r device_id; do
+                    [[ -n "$device_id" ]] || continue
+                    if run_user xinput list-props "$device_id" 2>/dev/null \
+                        | grep -q "libinput Accel Profile Enabled"; then
+                        if run_user xinput set-prop "$device_id" \
+                            "libinput Accel Profile Enabled" 0 1 0 \
+                            >>"$LOG_FILE" 2>&1; then
+                            changed=1
+                        fi
+                    fi
+                done < <(run_user xinput list --id-only 2>/dev/null || true)
+
+                if (( changed == 1 )); then
+                    ok "Mouse acceleration disabled for the current session"
+                else
+                    warn "No compatible libinput pointer device was found"
+                fi
+                break
+                ;;
+            2)
+                ok "Mouse acceleration setting kept"
+                break
+                ;;
+            *)
+                echo "Invalid choice. Enter 1 or 2:"
+                ;;
+        esac
+    done
 }
 
 create_optional_shortcut() {
@@ -1387,7 +1932,9 @@ current_refresh() {
 choose_resolution() {
     cat <<'EOF'
 
+=========================================
 Choose Display Resolution
+=========================================
 
 4:3
 [1] 1024x768
@@ -1441,7 +1988,9 @@ EOF
 choose_refresh() {
     cat <<'EOF'
 
+=========================================
 Choose Refresh Rate
+=========================================
 
 [1] 60 Hz
 [2] 75 Hz
@@ -1697,8 +2246,10 @@ cleanup() {
     rm -f \
         /tmp/discord-latest.deb \
         /tmp/lutris-latest.deb \
+        /tmp/mangohud-latest.tar.gz \
         /tmp/sunshine-latest.deb
 
+    rm -rf /tmp/mangohud-github-release
 }
 
 copy_support_log() {
@@ -1731,6 +2282,7 @@ summary() {
     echo "-------------------------"
     printf '%-18s %s\n' "GPU.............." "$(value GPU)"
     printf '%-18s %s\n' "Driver..........." "$(value Driver)"
+    printf '%-18s %s\n' "Driver update...." "$(value "NVIDIA driver update")"
     printf '%-18s %s\n' "CUDA............." "$(value CUDA)"
     printf '%-18s %s\n' "NVENC............" "$(value NVENC)"
     printf '%-18s %s\n' "OpenGL..........." "$(value OpenGL)"
@@ -1745,6 +2297,8 @@ summary() {
     printf '%-18s %s\n' "Lutris..........." "$(value Lutris)"
     printf '%-18s %s\n' "Wine............." "$(value Wine)"
     printf '%-18s %s\n' "Sunshine........." "$(value Sunshine)"
+    printf '%-18s %s\n' "Sunshine nice...." "$(value "Sunshine privileges")"
+    printf '%-18s %s\n' "Selkies/WebRTC..." "$(value Selkies)"
     printf '%-18s %s\n' "Tailscale........" "$(value Tailscale)"
     echo
     echo "Desktop"
@@ -1779,21 +2333,45 @@ summary() {
 
 main() {
     require_root
+
+    # Refuse to make system changes if the downloaded script is malformed or
+    # contains the known Sunshine/set -u regression.
+    if ! self_check_script >/dev/null; then
+        self_check_script || true
+        exit 1
+    fi
+
     init_log
     banner
     detect_environment
     disable_automatic_updates || exit 1
 
+    remove_selkies_webrtc
+    update_nvidia_driver_with_reboot
+
     verify_system
     install_and_update_applications
+
+    wait_for_desktop_session
     configure_tailscale
     configure_sunshine
     configure_host_optimizations
     configure_desktop
+    configure_mouse_acceleration
     configure_display
     final_verification
     cleanup
     summary
 }
+
+if [[ "${1:-}" == "--self-check" ]]; then
+    self_check_script
+    exit $?
+fi
+
+if [[ "${1:-}" == "--version" ]]; then
+    echo "${SCRIPT_NAME} ${SCRIPT_VERSION} (${SCRIPT_BUILD})"
+    exit 0
+fi
 
 main "$@"
