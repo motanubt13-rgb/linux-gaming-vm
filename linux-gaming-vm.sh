@@ -921,7 +921,6 @@ verify_system() {
     fi
 
     for pair in \
-        "Lutris:lutris" \
         "Wine:wine" \
         "Sunshine:sunshine" \
         "Tailscale:tailscale"; do
@@ -948,11 +947,6 @@ normalize_version() {
 
     version="${version#v}"
     version="${version#V}"
-    version="${version#lutris-}"
-    version="${version#Lutris-}"
-    version="${version#MangoHud-}"
-    version="${version#mangohud-}"
-
     # Keep the first numeric dotted version, optionally including a suffix.
     grep -oE '[0-9]+([.][0-9]+){1,3}([~+._-][0-9A-Za-z.-]+)?' \
         <<<"$version" | head -n1
@@ -978,220 +972,6 @@ github_release_asset_url() {
             | select(.name | test($regex; "i"))
         ][0].browser_download_url // empty
     ' <<<"$release_json"
-}
-
-install_or_update_lutris_github() {
-    local repository="lutris/lutris"
-    local release_json=""
-    local latest_tag=""
-    local latest_version=""
-    local installed_raw=""
-    local installed_version=""
-    local asset_url=""
-    local temp_deb="/tmp/lutris-latest.deb"
-
-    info "Checking Lutris version"
-
-    release_json="$(github_latest_release_json "$repository" || true)"
-
-    if [[ -z "$release_json" ]]; then
-        write_log WARN "Lutris GitHub release check failed; using APT fallback"
-        apt_install_or_update lutris lutris Lutris
-        return
-    fi
-
-    if [[ "$(jq -r '.prerelease // false' <<<"$release_json")" == "true" \
-       || "$(jq -r '.draft // false' <<<"$release_json")" == "true" ]]; then
-        write_log WARN "Latest Lutris GitHub release is not stable; using APT fallback"
-        apt_install_or_update lutris lutris Lutris
-        return
-    fi
-
-    latest_tag="$(jq -r '.tag_name // empty' <<<"$release_json")"
-    latest_version="$(normalize_version "$latest_tag")"
-    installed_raw="$(lutris --version 2>/dev/null | head -n1 || true)"
-    installed_version="$(normalize_version "$installed_raw")"
-
-    write_log INFO "Lutris installed version: ${installed_version:-not installed}"
-    write_log INFO "Lutris latest GitHub version: ${latest_version:-unknown}"
-
-    if [[ -n "$installed_version" && -n "$latest_version" ]] \
-       && ! dpkg --compare-versions "$latest_version" gt "$installed_version"; then
-        STATUS["Lutris"]="Already latest"
-        ok "Lutris is already latest"
-        return
-    fi
-
-    asset_url="$(github_release_asset_url \
-        "$release_json" \
-        'lutris.*(_all|all|amd64).*\.deb$|lutris.*\.deb$')"
-
-    if [[ -z "$asset_url" ]]; then
-        write_log WARN "No compatible Lutris .deb asset found; using APT fallback"
-        apt_install_or_update lutris lutris Lutris
-        return
-    fi
-
-    if ! run_long "Downloading Lutris ${latest_tag:-latest}" \
-        curl -fL --retry 3 "$asset_url" -o "$temp_deb"; then
-        STATUS["Lutris"]="Download failed"
-        return 1
-    fi
-
-    wait_apt || return 1
-
-    if run_long "Installing Lutris ${latest_tag:-latest}" \
-        env DEBIAN_FRONTEND=noninteractive apt-get install -y "$temp_deb"; then
-
-        STATUS["Lutris"]="$(
-            [[ -n "$installed_version" ]] && echo Updated || echo Installed
-        )"
-        rm -f "$temp_deb"
-        return 0
-    fi
-
-    STATUS["Lutris"]="Install or update failed"
-    rm -f "$temp_deb"
-    return 1
-}
-
-install_or_update_mangohud_github() {
-    local repository="flightlessmango/MangoHud"
-    local release_json=""
-    local latest_tag=""
-    local latest_version=""
-    local installed_raw=""
-    local installed_version=""
-    local asset_url=""
-    local temp_archive="/tmp/mangohud-latest.tar.gz"
-    local temp_dir="/tmp/mangohud-github-release"
-    local installer=""
-
-    info "Checking MangoHud version"
-
-    release_json="$(github_latest_release_json "$repository" || true)"
-
-    if [[ -z "$release_json" ]]; then
-        write_log WARN "MangoHud GitHub release check failed; using APT fallback"
-        apt_install_or_update mangohud mangohud MangoHud
-        return
-    fi
-
-    if [[ "$(jq -r '.prerelease // false' <<<"$release_json")" == "true" \
-       || "$(jq -r '.draft // false' <<<"$release_json")" == "true" ]]; then
-        write_log WARN "Latest MangoHud GitHub release is not stable; using APT fallback"
-        apt_install_or_update mangohud mangohud MangoHud
-        return
-    fi
-
-    latest_tag="$(jq -r '.tag_name // empty' <<<"$release_json")"
-    latest_version="$(normalize_version "$latest_tag")"
-    installed_raw="$(mangohud --version 2>/dev/null | head -n1 || true)"
-    installed_version="$(normalize_version "$installed_raw")"
-
-    # Ubuntu's older MangoHud package may not support --version reliably.
-    if [[ -z "$installed_version" ]]; then
-        installed_version="$(normalize_version "$(installed_version mangohud)")"
-    fi
-
-    write_log INFO "MangoHud installed version: ${installed_version:-not installed}"
-    write_log INFO "MangoHud latest GitHub version: ${latest_version:-unknown}"
-
-    if [[ -n "$installed_version" && -n "$latest_version" ]] \
-       && ! dpkg --compare-versions "$latest_version" gt "$installed_version"; then
-        STATUS["MangoHud"]="Already latest"
-        ok "MangoHud is already latest"
-        return
-    fi
-
-    asset_url="$(github_release_asset_url \
-        "$release_json" \
-        '(MangoHud|mangohud).*(x86_64|amd64)?.*\.tar\.(gz|xz)$')"
-
-    if [[ -z "$asset_url" ]]; then
-        write_log WARN "No compatible MangoHud release archive found; using APT fallback"
-        apt_install_or_update mangohud mangohud MangoHud
-        return
-    fi
-
-    if ! run_long "Downloading MangoHud ${latest_tag:-latest}" \
-        curl -fL --retry 3 "$asset_url" -o "$temp_archive"; then
-        STATUS["MangoHud"]="Download failed"
-        return 1
-    fi
-
-    rm -rf "$temp_dir"
-    mkdir -p "$temp_dir"
-
-    if ! tar -xf "$temp_archive" -C "$temp_dir" >>"$LOG_FILE" 2>&1; then
-        STATUS["MangoHud"]="Extraction failed"
-        error "MangoHud release archive could not be extracted"
-        rm -rf "$temp_dir" "$temp_archive"
-        return 1
-    fi
-
-    installer="$(find "$temp_dir" -type f -name mangohud-setup.sh | head -n1)"
-
-    if [[ -z "$installer" ]]; then
-        STATUS["MangoHud"]="Installer not found"
-        error "MangoHud release installer was not found"
-        rm -rf "$temp_dir" "$temp_archive"
-        return 1
-    fi
-
-    chmod +x "$installer"
-
-    if run_long "Installing MangoHud ${latest_tag:-latest}" \
-        bash -c 'cd "$1" && ./mangohud-setup.sh install' \
-        _ "$(dirname "$installer")"; then
-
-        STATUS["MangoHud"]="$(
-            [[ -n "$installed_version" ]] && echo Updated || echo Installed
-        )"
-        rm -rf "$temp_dir" "$temp_archive"
-        return 0
-    fi
-
-    STATUS["MangoHud"]="Install or update failed"
-    rm -rf "$temp_dir" "$temp_archive"
-    return 1
-}
-
-install_or_update_discord() {
-    local temp_deb="/tmp/discord-latest.deb"
-    local installed=""
-    local downloaded=""
-
-    if ! run_long "Downloading Discord" \
-        curl -fL --retry 3 \
-        "https://discord.com/api/download?platform=linux&format=deb" \
-        -o "$temp_deb"; then
-        STATUS["Discord"]="Download failed"
-        return 1
-    fi
-
-    downloaded="$(dpkg-deb -f "$temp_deb" Version 2>/dev/null || true)"
-    installed="$(installed_version discord)"
-
-    if [[ -n "$installed" && -n "$downloaded" ]] \
-       && ! dpkg --compare-versions "$downloaded" gt "$installed"; then
-        STATUS["Discord"]="Already latest"
-        ok "Discord is already latest"
-        rm -f "$temp_deb"
-        return 0
-    fi
-
-    wait_apt || return 1
-
-    if run_long "Installing Discord" \
-        env DEBIAN_FRONTEND=noninteractive apt-get install -y "$temp_deb"; then
-        STATUS["Discord"]="$([[ -n "$installed" ]] && echo Updated || echo Installed)"
-        rm -f "$temp_deb"
-        return 0
-    fi
-
-    STATUS["Discord"]="Install or update failed"
-    return 1
 }
 
 install_or_update_tailscale() {
@@ -1355,9 +1135,7 @@ install_and_update_applications() {
     env DEBIAN_FRONTEND=noninteractive dpkg --configure -a >>"$LOG_FILE" 2>&1 || true
 
     # Essential gaming tools and applications keep their version-aware updates.
-    install_or_update_mangohud_github || true
     apt_install_or_update steam-installer steam Steam || true
-    install_or_update_lutris_github || true
 
     if dpkg -s winehq-staging >/dev/null 2>&1; then
         apt_install_or_update winehq-staging wine "Wine Staging" || true
@@ -1372,7 +1150,6 @@ install_and_update_applications() {
     apt_install_or_update firefox firefox Firefox || true
     apt_install_or_update google-chrome-stable google-chrome "Google Chrome" || true
 
-    install_or_update_discord || true
     flatpak_install_or_update net.davidotek.pupgui2 ProtonUp-Qt || true
     install_or_update_tailscale || true
     install_or_update_sunshine || true
@@ -1841,17 +1618,6 @@ configure_desktop() {
         firefox.desktop \
         org.mozilla.firefox.desktop || true
 
-    create_shortcut Lutris \
-        net.lutris.Lutris.desktop \
-        lutris.desktop || true
-
-    create_optional_shortcut Discord \
-        discord.desktop \
-        Discord.desktop \
-        com.discordapp.Discord.desktop \
-        com.discordapp.discord.desktop \
-        "*discord*.desktop" || true
-
     local sunshine_shortcut="${DESKTOP_HOME}/Desktop/Sunshine Web UI.desktop"
     local trash_shortcut="${DESKTOP_HOME}/Desktop/Trash.desktop"
     local shortcut_url="$SUNSHINE_URL"
@@ -2188,8 +1954,6 @@ final_verification() {
     verify_app_final Steam steam
     verify_app_final "Google Chrome" google-chrome
     verify_app_final Firefox firefox
-    verify_app_final Discord discord
-    verify_app_final Lutris lutris
     verify_app_final Wine wine
     verify_app_final Sunshine sunshine
     verify_app_final Tailscale tailscale
@@ -2243,13 +2007,7 @@ cleanup() {
 
     run_long "Cleaning APT cache" apt-get autoclean || true
 
-    rm -f \
-        /tmp/discord-latest.deb \
-        /tmp/lutris-latest.deb \
-        /tmp/mangohud-latest.tar.gz \
-        /tmp/sunshine-latest.deb
-
-    rm -rf /tmp/mangohud-github-release
+    rm -f /tmp/sunshine-latest.deb
 }
 
 copy_support_log() {
@@ -2293,8 +2051,6 @@ summary() {
     printf '%-18s %s\n' "Steam............" "$(value Steam)"
     printf '%-18s %s\n' "Chrome..........." "$(value "Google Chrome")"
     printf '%-18s %s\n' "Firefox.........." "$(value Firefox)"
-    printf '%-18s %s\n' "Discord.........." "$(value Discord)"
-    printf '%-18s %s\n' "Lutris..........." "$(value Lutris)"
     printf '%-18s %s\n' "Wine............." "$(value Wine)"
     printf '%-18s %s\n' "Sunshine........." "$(value Sunshine)"
     printf '%-18s %s\n' "Sunshine nice...." "$(value "Sunshine privileges")"
