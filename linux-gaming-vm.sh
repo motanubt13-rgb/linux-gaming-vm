@@ -29,8 +29,6 @@ XAUTHORITY_VALUE=""
 
 TAILSCALE_IP="Not connected"
 SUNSHINE_URL="Unavailable"
-ANYDESK_ID="Unavailable"
-ANYDESK_PASSWORD="Parola132"
 NVIDIA_REBOOT_MARKER="${LOG_DIR}/nvidia-reboot.pending"
 APT_INDEX_REFRESHED=0
 RESOLUTION="Keep current"
@@ -1018,82 +1016,6 @@ install_or_update_tailscale() {
     apt_install_or_update tailscale tailscale Tailscale
 }
 
-install_or_update_anydesk() {
-    local repository_file="/etc/apt/sources.list.d/anydesk-stable.list"
-    local keyring_file="/etc/apt/keyrings/keys.anydesk.com.asc"
-    local repository_line="deb [signed-by=${keyring_file}] https://deb.anydesk.com all main"
-    local attempt
-
-    info "Installing and configuring AnyDesk"
-
-    wait_apt || return 1
-
-    if ! env DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        ca-certificates curl apt-transport-https >>"$LOG_FILE" 2>&1; then
-        STATUS["AnyDesk"]="Dependencies failed"
-        error "AnyDesk dependencies could not be installed"
-        return 1
-    fi
-
-    install -d -m 0755 /etc/apt/keyrings
-
-    if ! curl -fsSL https://keys.anydesk.com/repos/DEB-GPG-KEY \
-        -o "$keyring_file"; then
-        STATUS["AnyDesk"]="Repository key failed"
-        error "AnyDesk repository key could not be downloaded"
-        return 1
-    fi
-
-    chmod a+r "$keyring_file"
-    printf '%s\n' "$repository_line" >"$repository_file"
-
-    if ! run_long "Updating AnyDesk package information" apt-get update; then
-        STATUS["AnyDesk"]="Repository update failed"
-        return 1
-    fi
-    APT_INDEX_REFRESHED=1
-
-    if ! run_long "Installing/updating AnyDesk" \
-        env DEBIAN_FRONTEND=noninteractive apt-get install -y anydesk; then
-        STATUS["AnyDesk"]="Install or update failed"
-        return 1
-    fi
-
-    if ! systemctl enable --now anydesk.service >>"$LOG_FILE" 2>&1; then
-        STATUS["AnyDesk"]="Service failed"
-        error "AnyDesk service could not be started"
-        return 1
-    fi
-
-    # AnyDesk requires root for setting the unattended-access password.
-    # Do not copy this command's input into the diagnostic log.
-    if ! printf '%s\n' "$ANYDESK_PASSWORD" | anydesk --set-password \
-        >/dev/null 2>&1; then
-        STATUS["AnyDesk"]="Password setup failed"
-        error "AnyDesk unattended-access password could not be configured"
-        return 1
-    fi
-
-    ANYDESK_ID=""
-    for attempt in {1..20}; do
-        ANYDESK_ID="$(anydesk --get-id 2>/dev/null | tr -d '[:space:]' || true)"
-        [[ -n "$ANYDESK_ID" ]] && break
-        sleep 1
-    done
-
-    if [[ -z "$ANYDESK_ID" ]]; then
-        ANYDESK_ID="Not available yet"
-        STATUS["AnyDesk"]="Installed; ID pending"
-        warn "AnyDesk is installed, but its ID is not available yet"
-        return 0
-    fi
-
-    STATUS["AnyDesk"]="Ready"
-    ok "AnyDesk is installed and unattended access is configured"
-    echo
-    echo "AnyDesk ID:       $ANYDESK_ID"
-}
-
 sunshine_asset_url() {
     local release_json="$1"
     local ubuntu_version="${VERSION_ID:-22.04}"
@@ -1258,7 +1180,6 @@ install_and_update_applications() {
     apt_install_or_update google-chrome-stable google-chrome "Google Chrome" || true
 
     flatpak_install_or_update net.davidotek.pupgui2 ProtonUp-Qt || true
-    install_or_update_anydesk || true
     install_or_update_tailscale || true
     install_or_update_sunshine || true
 
@@ -1726,10 +1647,6 @@ configure_desktop() {
         firefox.desktop \
         org.mozilla.firefox.desktop || true
 
-    create_shortcut AnyDesk \
-        anydesk.desktop \
-        com.anydesk.Anydesk.desktop || true
-
     local sunshine_shortcut="${DESKTOP_HOME}/Desktop/Sunshine Web UI.desktop"
     local trash_shortcut="${DESKTOP_HOME}/Desktop/Trash.desktop"
     local shortcut_url="$SUNSHINE_URL"
@@ -2067,14 +1984,8 @@ final_verification() {
     verify_app_final "Google Chrome" google-chrome
     verify_app_final Firefox firefox
     verify_app_final Wine wine
-    verify_app_final AnyDesk anydesk
     verify_app_final Sunshine sunshine
     verify_app_final Tailscale tailscale
-
-    if command -v anydesk >/dev/null 2>&1; then
-        ANYDESK_ID="$(anydesk --get-id 2>/dev/null | tr -d '[:space:]' || true)"
-        ANYDESK_ID="${ANYDESK_ID:-Not available yet}"
-    fi
 
     if tailscale status >/dev/null 2>&1; then
         STATUS["Tailscale"]="Connected"
@@ -2170,7 +2081,6 @@ summary() {
     printf '%-18s %s\n' "Chrome..........." "$(value "Google Chrome")"
     printf '%-18s %s\n' "Firefox.........." "$(value Firefox)"
     printf '%-18s %s\n' "Wine............." "$(value Wine)"
-    printf '%-18s %s\n' "AnyDesk.........." "$(value AnyDesk)"
     printf '%-18s %s\n' "Sunshine........." "$(value Sunshine)"
     printf '%-18s %s\n' "Sunshine nice...." "$(value "Sunshine privileges")"
     printf '%-18s %s\n' "Selkies/WebRTC..." "$(value Selkies)"
@@ -2186,7 +2096,6 @@ summary() {
     echo "-------------------------"
     printf '%-18s %s\n' "Tailscale IP....." "$TAILSCALE_IP"
     printf '%-18s %s\n' "Sunshine Web....." "$SUNSHINE_URL"
-    printf '%-18s %s\n' "AnyDesk ID......." "$ANYDESK_ID"
     echo
 
     echo "Finished with $ERRORS Error(s) and $WARNINGS Warning(s)"
