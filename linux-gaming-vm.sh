@@ -10,8 +10,8 @@ set -u
 set -o pipefail
 
 SCRIPT_NAME="Linux-Gaming-VM"
-SCRIPT_VERSION="1.4-test2"
-SCRIPT_BUILD="2026-08-08-r2"
+SCRIPT_VERSION="V0.3"
+SCRIPT_BUILD="2026-08-10-r3"
 
 LOG_DIR="/var/lib/.linux-gaming-vm"
 LOG_FILE="${LOG_DIR}/linux-gaming-vm.log"
@@ -30,6 +30,8 @@ XAUTHORITY_VALUE=""
 TAILSCALE_IP="Not connected"
 SUNSHINE_URL="Unavailable"
 NVIDIA_REBOOT_MARKER="${LOG_DIR}/nvidia-reboot.pending"
+APT_REFRESH_MARKER="${LOG_DIR}/apt-index-refreshed"
+APT_REFRESH_MAX_AGE=3600
 APT_INDEX_REFRESHED=0
 RESOLUTION="Keep current"
 REFRESH_RATE="Keep current"
@@ -180,8 +182,8 @@ banner() {
     cat <<'EOF'
 =========================================
 Linux-Gaming-VM
-Version 0.2
-Build 2026-08-08-r2
+Version V0.3
+Build 2026-08-10-r3
 =========================================
 
 This script is designed for Vast.ai KVM virtual machines.
@@ -438,6 +440,50 @@ wait_apt() {
     done
 }
 
+apt_indexes_are_fresh() {
+    local now=""
+    local refreshed_at=""
+    local age=""
+
+    if (( APT_INDEX_REFRESHED == 1 )); then
+        return 0
+    fi
+
+    [[ -f "$APT_REFRESH_MARKER" ]] || return 1
+
+    now="$(date +%s)"
+    refreshed_at="$(stat -c %Y "$APT_REFRESH_MARKER" 2>/dev/null || true)"
+    [[ "$refreshed_at" =~ ^[0-9]+$ ]] || return 1
+
+    age=$((now - refreshed_at))
+    if (( age >= 0 && age <= APT_REFRESH_MAX_AGE )); then
+        APT_INDEX_REFRESHED=1
+        return 0
+    fi
+
+    return 1
+}
+
+refresh_apt_indexes() {
+    local description="${1:-Updating APT package indexes}"
+
+    if apt_indexes_are_fresh; then
+        ok "APT package indexes were refreshed recently"
+        return 0
+    fi
+
+    wait_apt || return 1
+
+    if ! run_long "$description" apt-get update; then
+        return 1
+    fi
+
+    touch "$APT_REFRESH_MARKER"
+    chmod 600 "$APT_REFRESH_MARKER"
+    APT_INDEX_REFRESHED=1
+    return 0
+}
+
 # ==============================================================================
 # Version and package helpers
 # ==============================================================================
@@ -510,6 +556,39 @@ apt_install_or_update() {
     ok "$label is installed"
 }
 
+set_batch_package_status() {
+    local label="$1"
+    local package="$2"
+    local command_name="$3"
+    local before_version="${4:-}"
+    local after_version=""
+
+    after_version="$(installed_version "$package")"
+
+    if [[ -z "$after_version" ]]; then
+        STATUS["$label"]="Install or update failed"
+        warn "$label was not installed by the grouped APT transaction"
+        return 1
+    fi
+
+    if [[ -n "$command_name" ]] \
+       && ! command -v "$command_name" >/dev/null 2>&1; then
+        STATUS["$label"]="Installed, command unavailable"
+        warn "$label package is installed, but $command_name is unavailable"
+        return 1
+    fi
+
+    if [[ -z "$before_version" ]]; then
+        STATUS["$label"]="Installed"
+    elif dpkg --compare-versions "$after_version" gt "$before_version"; then
+        STATUS["$label"]="Updated"
+    else
+        STATUS["$label"]="Already latest"
+    fi
+
+    ok "$label: ${STATUS[$label]}"
+}
+
 ensure_flatpak() {
     local flatpak_packages=(
         flatpak
@@ -520,17 +599,26 @@ ensure_flatpak() {
         xdg-utils
         desktop-file-utils
     )
+    local missing_packages=()
+    local package=""
 
-    wait_apt || return 1
+    for package in "${flatpak_packages[@]}"; do
+        dpkg -s "$package" >/dev/null 2>&1 || missing_packages+=("$package")
+    done
 
-    if run_long "Installing Flatpak browser integration" \
-        env DEBIAN_FRONTEND=noninteractive apt-get install -y "${flatpak_packages[@]}"; then
-        STATUS["Flatpak"]="Installed and integrated"
-        ok "Flatpak and KDE Discover integration are installed"
-    else
-        STATUS["Flatpak"]="Install failed"
-        return 1
+    if (( ${#missing_packages[@]} > 0 )); then
+        wait_apt || return 1
+
+        if ! run_long "Installing Flatpak browser integration" \
+            env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+                "${missing_packages[@]}"; then
+            STATUS["Flatpak"]="Install failed"
+            return 1
+        fi
     fi
+
+    STATUS["Flatpak"]="Installed and integrated"
+    ok "Flatpak and KDE Discover integration are installed"
 
     if ! flatpak remotes --system --columns=name 2>/dev/null | grep -qx flathub; then
         if run_long "Configuring Flathub" \
@@ -584,60 +672,115 @@ flatpak_install_or_update() {
 # Selkies/WebRTC removal and NVIDIA driver update with manual reboot marker
 # ==============================================================================
 
+selkies_cleanup_needed() {
+    local unit=""
+
+    if pgrep -f 'selkies-gstreamer|selkies-launcher.sh' >/dev/null 2>&1 \
+       || [[ -d /opt/selkies-gstreamer ]] \
+       || [[ -e /usr/local/bin/selkies-launcher.sh ]]; then
+        return 0
+    fi
+
+    if [[ -d /etc/supervisor/conf.d ]] \
+       && grep -RqiE 'selkies-gstreamer|selkies-launcher' \
+            /etc/supervisor/conf.d 2>/dev/null; then
+        return 0
+    fi
+
+    if [[ -d "${DESKTOP_HOME}/.config/autostart" ]] \
+       && find "${DESKTOP_HOME}/.config/autostart" -maxdepth 1 \
+            -iname '*selkies*' -print -quit 2>/dev/null | grep -q .; then
+        return 0
+    fi
+
+    for unit in selkies.service selkies-gstreamer.service selkies-launcher.service; do
+        if systemctl is-active --quiet "$unit" 2>/dev/null \
+           || systemctl is-enabled --quiet "$unit" 2>/dev/null \
+           || systemctl --machine="${DESKTOP_USER}@.host" --user \
+                is-active --quiet "$unit" 2>/dev/null \
+           || systemctl --machine="${DESKTOP_USER}@.host" --user \
+                is-enabled --quiet "$unit" 2>/dev/null; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 remove_selkies_webrtc() {
     echo
     echo "========================================="
     echo "Remove Selkies WebRTC"
     echo "========================================="
 
-    info "Stopping and removing Selkies WebRTC components"
+    if ! selkies_cleanup_needed; then
+        STATUS["Selkies"]="Not active"
+        info "Selkies WebRTC is not active; cleanup skipped"
+        return 0
+    fi
 
-    # Stop restart loops before removing files.
-    pkill -TERM -f '/opt/selkies-gstreamer|selkies-gstreamer|selkies-launcher.sh' \
-        >>"$LOG_FILE" 2>&1 || true
-    sleep 1
-    pkill -KILL -f '/opt/selkies-gstreamer|selkies-gstreamer|selkies-launcher.sh' \
-        >>"$LOG_FILE" 2>&1 || true
+    info "Stopping and removing detected Selkies WebRTC components"
 
-    # Remove Supervisor entries that explicitly launch Selkies.
-    local supervisor_file
+    if pgrep -f 'selkies-gstreamer|selkies-launcher.sh' >/dev/null 2>&1; then
+        pkill -TERM -f 'selkies-gstreamer|selkies-launcher.sh' \
+            >>"$LOG_FILE" 2>&1 || true
+        sleep 1
+        pkill -KILL -f 'selkies-gstreamer|selkies-launcher.sh' \
+            >>"$LOG_FILE" 2>&1 || true
+    fi
+
+    local supervisor_file=""
+    local supervisor_changed=0
     if [[ -d /etc/supervisor/conf.d ]]; then
         while IFS= read -r supervisor_file; do
             [[ -n "$supervisor_file" ]] || continue
             if grep -qiE 'selkies-gstreamer|selkies-launcher' "$supervisor_file" 2>/dev/null; then
                 write_log INFO "Removing Selkies Supervisor config: $supervisor_file"
                 rm -f "$supervisor_file"
+                supervisor_changed=1
             fi
         done < <(find /etc/supervisor/conf.d -maxdepth 1 -type f -name '*.conf' 2>/dev/null)
 
-        if command -v supervisorctl >/dev/null 2>&1; then
+        if (( supervisor_changed == 1 )) && command -v supervisorctl >/dev/null 2>&1; then
             supervisorctl reread >>"$LOG_FILE" 2>&1 || true
             supervisorctl update >>"$LOG_FILE" 2>&1 || true
         fi
     fi
 
-    # Disable known system and user services if they exist.
-    local unit
+    # Stop only Selkies. Removing its exact enablement links avoids following
+    # an "Also=pipewire.socket" relationship from the vendor unit.
+    local unit=""
     for unit in selkies.service selkies-gstreamer.service selkies-launcher.service; do
-        systemctl disable --now "$unit" >>"$LOG_FILE" 2>&1 || true
+        systemctl stop "$unit" >>"$LOG_FILE" 2>&1 || true
         systemctl --machine="${DESKTOP_USER}@.host" --user \
-            disable --now "$unit" >>"$LOG_FILE" 2>&1 || true
+            stop "$unit" >>"$LOG_FILE" 2>&1 || true
+
+        find /etc/systemd/system -type l -name "$unit" -delete 2>/dev/null || true
+        if [[ -d "${DESKTOP_HOME}/.config/systemd/user" ]]; then
+            find "${DESKTOP_HOME}/.config/systemd/user" -type l \
+                -name "$unit" -delete 2>/dev/null || true
+        fi
     done
 
     rm -f \
         /usr/local/bin/selkies-launcher.sh \
         /etc/systemd/system/selkies.service \
         /etc/systemd/system/selkies-gstreamer.service \
-        /etc/systemd/system/selkies-launcher.service
+        /etc/systemd/system/selkies-launcher.service \
+        "${DESKTOP_HOME}/.config/systemd/user/selkies.service" \
+        "${DESKTOP_HOME}/.config/systemd/user/selkies-gstreamer.service" \
+        "${DESKTOP_HOME}/.config/systemd/user/selkies-launcher.service"
 
     rm -rf /opt/selkies-gstreamer
 
     if [[ -d "${DESKTOP_HOME}/.config/autostart" ]]; then
-        find "${DESKTOP_HOME}/.config/autostart" -maxdepth 1 -type f \
+        find "${DESKTOP_HOME}/.config/autostart" -maxdepth 1 \
             -iname '*selkies*' -delete 2>/dev/null || true
     fi
 
     systemctl daemon-reload >>"$LOG_FILE" 2>&1 || true
+    systemctl --machine="${DESKTOP_USER}@.host" --user \
+        daemon-reload >>"$LOG_FILE" 2>&1 || true
 
     if pgrep -f 'selkies-gstreamer|selkies-launcher.sh' >/dev/null 2>&1; then
         STATUS["Selkies"]="Still running"
@@ -754,9 +897,7 @@ update_nvidia_driver_with_reboot() {
         return 0
     fi
 
-    wait_apt || return 1
-    run_long "Refreshing package indexes for NVIDIA" apt-get update || return 1
-    APT_INDEX_REFRESHED=1
+    refresh_apt_indexes "Refreshing package indexes for NVIDIA" || return 1
 
     local meta=""
     local installed=""
@@ -1012,7 +1153,7 @@ install_or_update_tailscale() {
         fi
     fi
 
-    apt-get update >>"$LOG_FILE" 2>&1 || true
+    refresh_apt_indexes "Updating APT package indexes for Tailscale" || return 1
     apt_install_or_update tailscale tailscale Tailscale
 }
 
@@ -1125,37 +1266,72 @@ install_or_update_sunshine() {
 }
 
 install_and_update_applications() {
+    local wine_package="wine"
+    local wine_label="Wine"
+    local chrome_available=0
+    local tailscale_available=0
+    local package=""
+    local candidate=""
+    local apt_batch_succeeded=0
+    local -a apt_packages=()
+    local -A versions_before=()
+
     echo
     echo "========================================="
     echo "Install and Update Applications"
     echo "========================================="
 
-    wait_apt || return 1
+    refresh_apt_indexes "Updating APT package indexes" || {
+        error "APT package indexes could not be updated"
+        return 1
+    }
 
-    if (( APT_INDEX_REFRESHED == 0 )); then
-        if ! run_long "Updating APT package indexes" apt-get update; then
-            error "APT package indexes could not be updated"
-            return 1
-        fi
-        APT_INDEX_REFRESHED=1
-    else
-        ok "APT package indexes were already refreshed in this run"
+    # Resolve the installed Wine flavor before constructing the single APT
+    # transaction. Existing WineHQ/Staging installations keep their flavor.
+    if dpkg -s winehq-staging >/dev/null 2>&1; then
+        wine_package="winehq-staging"
+        wine_label="Wine Staging"
+    elif dpkg -s wine-staging >/dev/null 2>&1; then
+        wine_package="wine-staging"
+        wine_label="Wine Staging"
     fi
 
-    # Install/update common APT utilities in one transaction. This preserves
-    # updates while avoiding repeated dependency resolution and dpkg startup.
-    local core_packages=(
+    apt_packages=(
         curl wget ca-certificates gnupg jq ffmpeg libcap2-bin
         gamemode nvtop btop vulkan-tools libvulkan1 mesa-utils
         x11-xserver-utils xinput xcvt
+        steam-installer "$wine_package" firefox
+        flatpak plasma-discover plasma-discover-backend-flatpak
+        xdg-desktop-portal xdg-desktop-portal-kde xdg-utils
+        desktop-file-utils
     )
 
+    candidate="$(candidate_version google-chrome-stable)"
+    if [[ -n "$candidate" && "$candidate" != "(none)" ]] \
+       || dpkg -s google-chrome-stable >/dev/null 2>&1; then
+        apt_packages+=(google-chrome-stable)
+        chrome_available=1
+    fi
+
+    candidate="$(candidate_version tailscale)"
+    if [[ -n "$candidate" && "$candidate" != "(none)" ]] \
+       || dpkg -s tailscale >/dev/null 2>&1; then
+        apt_packages+=(tailscale)
+        tailscale_available=1
+    fi
+
+    for package in steam-installer "$wine_package" firefox \
+        google-chrome-stable tailscale; do
+        versions_before["$package"]="$(installed_version "$package")"
+    done
+
     wait_apt || return 1
-    if run_long "Installing/updating core gaming utilities" \
-        env DEBIAN_FRONTEND=noninteractive apt-get install -y "${core_packages[@]}"; then
-        ok "Core gaming utilities are installed and up to date"
+    if run_long "Installing/updating APT applications and gaming utilities" \
+        env DEBIAN_FRONTEND=noninteractive apt-get install -y "${apt_packages[@]}"; then
+        apt_batch_succeeded=1
+        ok "APT applications and gaming utilities are installed and up to date"
     else
-        warn "One or more core utilities could not be updated"
+        warn "One or more grouped APT packages could not be installed or updated"
     fi
 
     # run_long waits for apt/dpkg to exit. This extra settle step repairs any
@@ -1163,24 +1339,33 @@ install_and_update_applications() {
     wait_apt || return 1
     env DEBIAN_FRONTEND=noninteractive dpkg --configure -a >>"$LOG_FILE" 2>&1 || true
 
-    # Essential gaming tools and applications keep their version-aware updates.
-    apt_install_or_update steam-installer steam Steam || true
+    set_batch_package_status Steam steam-installer steam \
+        "${versions_before[steam-installer]}" || true
+    set_batch_package_status "$wine_label" "$wine_package" wine \
+        "${versions_before[$wine_package]}" || true
+    STATUS["Wine"]="${STATUS[$wine_label]:-Unknown}"
+    set_batch_package_status Firefox firefox firefox \
+        "${versions_before[firefox]}" || true
 
-    if dpkg -s winehq-staging >/dev/null 2>&1; then
-        apt_install_or_update winehq-staging wine "Wine Staging" || true
-        STATUS["Wine"]="${STATUS["Wine Staging"]:-Installed}"
-    elif dpkg -s wine-staging >/dev/null 2>&1; then
-        apt_install_or_update wine-staging wine "Wine Staging" || true
-        STATUS["Wine"]="${STATUS["Wine Staging"]:-Installed}"
+    if (( chrome_available == 1 )); then
+        set_batch_package_status "Google Chrome" google-chrome-stable \
+            google-chrome "${versions_before[google-chrome-stable]}" || true
     else
-        apt_install_or_update wine wine Wine || true
+        STATUS["Google Chrome"]="Repository unavailable"
+        warn "Google Chrome repository is unavailable; package skipped"
     fi
 
-    apt_install_or_update firefox firefox Firefox || true
-    apt_install_or_update google-chrome-stable google-chrome "Google Chrome" || true
-
     flatpak_install_or_update net.davidotek.pupgui2 ProtonUp-Qt || true
-    install_or_update_tailscale || true
+
+    if (( tailscale_available == 1 && apt_batch_succeeded == 1 )); then
+        set_batch_package_status Tailscale tailscale tailscale \
+            "${versions_before[tailscale]}" || true
+    else
+        # On a fresh image, the official installer adds the Tailscale repository.
+        # Subsequent runs use the grouped APT transaction above.
+        install_or_update_tailscale || true
+    fi
+
     install_or_update_sunshine || true
 
     wait_apt || true
@@ -1609,6 +1794,28 @@ create_optional_shortcut() {
     ok "$label desktop shortcut created"
 }
 
+apply_kde_dark_theme() {
+    local config_tool=""
+
+    if command -v kwriteconfig6 >/dev/null 2>&1; then
+        config_tool="kwriteconfig6"
+    elif command -v kwriteconfig5 >/dev/null 2>&1; then
+        config_tool="kwriteconfig5"
+    else
+        return 1
+    fi
+
+    # Relative config names prevent KDE from generating malformed D-Bus object
+    # paths such as //home/user/.config/... while updating the settings.
+    run_user "$config_tool" --file kdeglobals \
+        --group General --key ColorScheme BreezeDark >>"$LOG_FILE" 2>&1 \
+        && run_user "$config_tool" --file kdeglobals \
+            --group KDE --key LookAndFeelPackage \
+            org.kde.breezedark.desktop >>"$LOG_FILE" 2>&1 \
+        && run_user "$config_tool" --file plasmarc \
+            --group Theme --key name breeze-dark >>"$LOG_FILE" 2>&1
+}
+
 configure_desktop() {
     echo
     echo "========================================="
@@ -1623,11 +1830,9 @@ configure_desktop() {
         return 1
     fi
 
-    if command -v lookandfeeltool >/dev/null 2>&1 \
-       && run_user lookandfeeltool -a org.kde.breezedark.desktop \
-            >>"$LOG_FILE" 2>&1; then
+    if apply_kde_dark_theme; then
         STATUS["Theme"]="Dark"
-        ok "KDE dark theme applied"
+        ok "KDE dark theme configured"
     else
         STATUS["Theme"]="Not applied"
         warn "KDE dark theme could not be applied"
@@ -2030,9 +2235,6 @@ cleanup() {
     echo "========================================="
 
     wait_apt || return 1
-
-    run_long "Removing unused packages" \
-        env DEBIAN_FRONTEND=noninteractive apt-get autoremove -y || true
 
     run_long "Cleaning APT cache" apt-get autoclean || true
 
