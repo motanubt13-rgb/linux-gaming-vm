@@ -511,7 +511,26 @@ apt_install_or_update() {
 }
 
 ensure_flatpak() {
-    apt_install_or_update flatpak flatpak Flatpak || return 1
+    local flatpak_packages=(
+        flatpak
+        plasma-discover
+        plasma-discover-backend-flatpak
+        xdg-desktop-portal
+        xdg-desktop-portal-kde
+        xdg-utils
+        desktop-file-utils
+    )
+
+    wait_apt || return 1
+
+    if run_long "Installing Flatpak browser integration" \
+        env DEBIAN_FRONTEND=noninteractive apt-get install -y "${flatpak_packages[@]}"; then
+        STATUS["Flatpak"]="Installed and integrated"
+        ok "Flatpak and KDE Discover integration are installed"
+    else
+        STATUS["Flatpak"]="Install failed"
+        return 1
+    fi
 
     if ! flatpak remotes --system --columns=name 2>/dev/null | grep -qx flathub; then
         if run_long "Configuring Flathub" \
@@ -522,6 +541,16 @@ ensure_flatpak() {
             return 1
         fi
     fi
+
+    # Files downloaded by the Install button on Flathub should open in
+    # KDE Discover, where the desktop user can confirm the installation.
+    run_user xdg-mime default org.kde.discover.desktop \
+        application/vnd.flatpak.ref >>"$LOG_FILE" 2>&1 || true
+    run_user xdg-mime default org.kde.discover.desktop \
+        application/vnd.flatpak.repo >>"$LOG_FILE" 2>&1 || true
+
+    STATUS["Flatpak"]="Ready for browser installs"
+    ok "Flathub browser installs will open in KDE Discover"
 }
 
 flatpak_install_or_update() {
