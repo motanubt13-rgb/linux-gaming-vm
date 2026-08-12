@@ -1,21 +1,26 @@
-MIT License
+Linux-Gaming-VM Source Available License
 
-Copyright (c) 2026 motanubt13-rgb
+Copyright (c) 2026 MotanuBT. All rights reserved.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+Permission is granted to download and execute an unmodified copy of
+Linux-Gaming-VM on a virtual machine controlled by the user, including through
+the official Vast.ai template and official GitHub repository.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+Without prior written permission from the copyright owner, you may not:
+
+1. Modify, redistribute, republish, sublicense, or sell this software.
+2. Include this software or substantial portions of it in another template,
+   repository, product, service, tutorial package, or commercial offering.
+3. Create and distribute derivative versions of this software.
+4. Remove or alter the author, copyright, license, repository, or branding
+   notices.
+5. Present this software, or a modified copy, as your own work.
+
+You may share links to the official repository and official Vast.ai template.
 
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+IMPLIED. THE COPYRIGHT OWNER SHALL NOT BE LIABLE FOR ANY CLAIM, DAMAGE, OR
+OTHER LIABILITY ARISING FROM THE USE OF THIS SOFTWARE.
+
+Official repository:
+https://github.com/motanubt13-rgb/linux-gaming-vm
