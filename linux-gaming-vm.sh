@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Linux-Gaming-VM
-# Version 0.2
+# Version 0.3
 #
 # Designed for Vast.ai KVM virtual machines running Ubuntu with KDE Plasma.
 # ==============================================================================
