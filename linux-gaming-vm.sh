@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Linux-Gaming-VM
-# Version 0.4
+# Version 0.5
 #
 # Designed for Vast.ai KVM virtual machines running Ubuntu with KDE Plasma.
 # ==============================================================================
@@ -10,8 +10,8 @@ set -u
 set -o pipefail
 
 SCRIPT_NAME="Linux-Gaming-VM"
-SCRIPT_VERSION="V0.4"
-SCRIPT_BUILD="2026-08-18-r6"
+SCRIPT_VERSION="V0.5"
+SCRIPT_BUILD="2026-10-14-r1"
 
 LOG_DIR="/var/lib/.linux-gaming-vm"
 LOG_FILE="${LOG_DIR}/linux-gaming-vm.log"
@@ -178,7 +178,7 @@ banner() {
     cat <<'EOF'
 =========================================
 Linux-Gaming-VM
-Version V0.4
+Version V0.5
 =========================================
 
 This script is optimized for Vast.ai KVM virtual machines.
@@ -1331,6 +1331,8 @@ configure_sunshine() {
     set_sunshine_option "$config_file" encoder nvenc
     set_sunshine_option "$config_file" upnp disabled
     set_sunshine_option "$config_file" origin_web_ui_allowed wan
+    # Tray-ul Qt6 face crash (Aborted/core dumped) pe Ubuntu 22.04 -> dezactivat
+    set_sunshine_option "$config_file" system_tray disabled
 
     if [[ "$TAILSCALE_IP" != "Not connected" ]]; then
         set_sunshine_option "$config_file" csrf_allowed_origins "https://${TAILSCALE_IP}:47990"
@@ -1346,29 +1348,50 @@ Exec=sunshine
 Hidden=false
 NoDisplay=false
 X-GNOME-Autostart-enabled=true
+X-KDE-autostart-after=panel
 Name=Sunshine
 EOF
     chown -R "$DESKTOP_USER:$DESKTOP_GROUP" "${DESKTOP_HOME}/.config/autostart"
 
+    # Pornire DOAR prin autostart KDE (pornește la fiecare login in sesiunea grafica).
+    # Serviciul systemd al pachetului depinde de graphical-session.target, care nu
+    # este activ pe KDE/SDDM, deci nu pornea dupa reboot si dubla autostart-ul.
     service="$(find_sunshine_service || true)"
-
-    if [[ -z "$service" ]]; then
-        STATUS["Sunshine"]="Service not found"
-        return 1
+    if [[ -n "$service" ]]; then
+        run_user systemctl --user disable --now "$service" >>"$LOG_FILE" 2>&1 || true
+        run_user systemctl --user daemon-reload >>"$LOG_FILE" 2>&1 || true
     fi
 
-    run_user systemctl --user stop "$service" >>"$LOG_FILE" 2>&1 || true
     pkill -TERM -x sunshine >>"$LOG_FILE" 2>&1 || true
     sleep 1
     pkill -KILL -x sunshine >>"$LOG_FILE" 2>&1 || true
 
     configure_sunshine_privileges || true
 
-    run_user systemctl --user daemon-reload >>"$LOG_FILE" 2>&1 || true
-    run_user systemctl --user enable --now "$service" >>"$LOG_FILE" 2>&1 || true
+    # Pornire acum, detasata de terminal
+    run_user setsid -f sunshine >>"$LOG_FILE" 2>&1 </dev/null || true
 
-    STATUS["Sunshine"]="Running (Autostart on boot)"
-    ok "Sunshine configured with Moonlight auto-resolution switcher"
+    # Verificare reala: proces activ + Web UI pe portul 47990
+    local attempt=0
+    local running=0
+    while (( attempt < 30 )); do
+        if pgrep -u "$DESKTOP_USER" -x sunshine >/dev/null 2>&1 \
+           && ss -tln 2>/dev/null | grep -q ':47990'; then
+            running=1
+            break
+        fi
+        sleep 1
+        ((attempt++)) || true
+    done
+
+    if (( running == 1 )); then
+        STATUS["Sunshine"]="Running (Autostart on boot)"
+        ok "Sunshine is running (Web UI on port 47990, autostart enabled)"
+    else
+        STATUS["Sunshine"]="Failed to start"
+        error "Sunshine did not start. Test manually as desktop user: sunshine"
+        return 1
+    fi
 }
 
 # ==============================================================================
@@ -1843,11 +1866,13 @@ main() {
 
     configure_audio
     configure_tailscale
-    configure_sunshine
     configure_host_optimizations
     configure_desktop
     configure_mouse_acceleration
     configure_display
+    # Sunshine porneste ULTIMUL, dupa schimbarea rezolutiei (captura NvFBC
+    # poate pica daca modul ecranului se schimba dupa pornire)
+    configure_sunshine
 
     summary
 }
